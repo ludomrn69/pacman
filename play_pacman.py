@@ -6,7 +6,7 @@ import ale_py
 gym.register_envs(ale_py)
 
 # Charge le modèle entraîné
-model = PPO.load("ppo_pacman")
+model = PPO.load("logs/best_model")
 
 # Environnement avec rendu visuel
 env = gym.make("ALE/MsPacman-v5", render_mode="human")
