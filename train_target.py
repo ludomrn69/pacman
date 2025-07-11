@@ -10,6 +10,7 @@ import sys
 import tensorflow as tf
 from keras import models, layers
 from keras import backend as K
+from keras.saving import register_keras_serializable
 import numpy as np
 import time
 import matplotlib.pyplot as plot
@@ -22,7 +23,7 @@ env = gym.make("ALE/MsPacman-v5", render_mode="rgb_array")
 print("Liste des actions", env.unwrapped.get_action_meanings())
 nbr_action = env.action_space.n
 
-file_model='my_model_target.keras'
+file_model='my_model_target'
 file_stats='tab_score_target'
 
 gamma=tf.constant(0.99)
@@ -30,6 +31,12 @@ tau = 0.005
 n_step = 5
 gamma_n = gamma ** n_step
 n_step_buffer = deque(maxlen=n_step)
+
+n_atoms = 51
+v_min = -10
+v_max = 10
+delta_z = (v_max - v_min) / (n_atoms - 1)
+z = tf.cast(tf.linspace(v_min, v_max, n_atoms), tf.float32)
 
 class LazyFrames:
   def __init__(self, frames):
@@ -41,7 +48,43 @@ class LazyFrames:
       out = out.astype(dtype)
     return out
 
-n_epochs=500
+@register_keras_serializable()
+class NoisyDense(layers.Layer):
+  def __init__(self, units, activation=None, sigma_init=0.017, **kwargs):
+    super(NoisyDense, self).__init__(**kwargs)
+    self.units = units
+    self.activation = layers.Activation(activation) if activation else None
+    self.sigma_init = sigma_init
+
+  def build(self, input_shape):
+    input_dim = int(input_shape[-1])
+    self.mu_w = self.add_weight(name="mu_w", shape=[input_dim, self.units],
+                                initializer=tf.keras.initializers.RandomUniform(-1/np.sqrt(input_dim), 1/np.sqrt(input_dim)))
+    self.sigma_w = self.add_weight(name="sigma_w", shape=[input_dim, self.units],
+                                   initializer=tf.keras.initializers.Constant(self.sigma_init))
+    self.mu_b = self.add_weight(name="mu_b", shape=[self.units],
+                                initializer=tf.keras.initializers.RandomUniform(-1/np.sqrt(input_dim), 1/np.sqrt(input_dim)))
+    self.sigma_b = self.add_weight(name="sigma_b", shape=[self.units],
+                                   initializer=tf.keras.initializers.Constant(self.sigma_init))
+
+  def call(self, x):
+    epsilon_w = tf.random.normal([tf.shape(x)[-1], self.units])
+    epsilon_b = tf.random.normal([self.units])
+    w = self.mu_w + self.sigma_w * epsilon_w
+    b = self.mu_b + self.sigma_b * epsilon_b
+    out = tf.matmul(x, w) + b
+    return self.activation(out) if self.activation else out
+
+  def get_config(self):
+      config = super().get_config()
+      config.update({
+          "units": self.units,
+          "activation": self.activation.activation if self.activation else None,
+          "sigma_init": self.sigma_init
+      })
+      return config
+
+n_epochs=250
 decalage_debut=90
 taille_sequence=6
 games_per_epoch=300
@@ -49,12 +92,9 @@ pourcentage_batch=0.20
 best_score=-np.inf
 
 epsilon = 1.0  # Starting value
-epsilon_min = 0.01  # Minimum value
-epsilon_decay_steps = 30_000  # Number of steps for linear decay
+epsilon_min = 0.03  # Minimum value
+epsilon_decay_steps = 35_000  # Number of steps for linear decay
 epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
-
-start_epsilon=1
-end_epsilon=100000  # steps
 
 tab_s = deque(maxlen=200)
 
@@ -92,27 +132,11 @@ def model(nbr_cc=32):
   x = layers.Conv2D(64, 3, strides=1, activation='relu')(x)
   x = layers.Flatten()(x)
   
-  # Dueling DQN
-  v = layers.Dense(512, activation='relu')(x)
-  v = layers.Dense(1)(v)
-  
-  a = layers.Dense(512, activation='relu')(x)
-  a = layers.Dense(nbr_action)(a)
-
-  # Solution simple : utiliser des couches séparées
-  # Répliquer V pour chaque action
-  v_expanded = layers.RepeatVector(int(nbr_action))(v)
-  v_expanded = layers.Reshape((int(nbr_action),))(v_expanded)
-  
-  # Calculer la moyenne des avantages
-  a_mean = layers.GlobalAveragePooling1D()(layers.Reshape((int(nbr_action), 1))(a))
-  a_mean = layers.RepeatVector(int(nbr_action))(layers.Reshape((1,))(a_mean))
-  a_mean = layers.Reshape((int(nbr_action),))(a_mean)
-  
-  # Combiner V et A
-  sortie = layers.Add()([v_expanded, layers.Subtract()([a, a_mean])])
-  
-  return models.Model(inputs=entree, outputs=sortie)
+  # C51 output: n_actions x n_atoms
+  output = NoisyDense(nbr_action * n_atoms)(x)
+  output = layers.Reshape((nbr_action, n_atoms))(output)
+  output = layers.Softmax(axis=-1)(output)  # Probabilités par action
+  return models.Model(inputs=entree, outputs=output)
 
 def transform_img(image):
   gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -148,8 +172,9 @@ def simulation(epsilon, debug=False):
   score=0
   while True:
     if np.random.random()>epsilon:
-      valeurs_q=model_primaire(np.expand_dims(np.array(tab_sequence), axis=0))
-      action=int(tf.argmax(valeurs_q[0], axis=-1))
+      dist=model_primaire(np.expand_dims(np.array(tab_sequence), axis=0))
+      q_values = tf.reduce_sum(z * dist, axis=2)
+      action=int(tf.argmax(q_values[0], axis=-1))
     else:
       action=np.random.randint(0, nbr_action)
 
@@ -179,8 +204,8 @@ def simulation(epsilon, debug=False):
       tab_observations=np.array(tab_observations, dtype=np.float32)
       tab_next_observations=np.array(tab_next_observations, dtype=np.float32)
       tab_rewards=np.array(tab_rewards, dtype=np.float32)
-      tab_rewards[tab_rewards==0]=-1.
-      tab_rewards[tab_rewards>10]=10.
+      tab_rewards = np.clip(tab_rewards, -1, 1)
+      tab_rewards += 0.1  # Bonus de survie
       tab_rewards = tab_rewards.reshape(-1)
       tab_actions=np.array(tab_actions, dtype=np.int32)
       if debug:
@@ -222,26 +247,39 @@ def train_step():
   done = tf.convert_to_tensor(np.array(done), dtype=tf.float32)
   weights = tf.convert_to_tensor(weights, dtype=tf.float32)
 
-  next_Q_values_primaire = model_primaire(next_obs)
-  best_next_actions = tf.math.argmax(next_Q_values_primaire, axis=1)
-  next_Q_values_cible = model_cible(next_obs)
-  next_mask = tf.one_hot(best_next_actions, nbr_action)
-  next_best_Q_values = tf.reduce_sum(next_Q_values_cible * next_mask, axis=1)
-  target_Q_values=rew+(1-done)*gamma*next_best_Q_values
-  target_Q_values=tf.reshape(target_Q_values, (-1, 1))
-  mask=tf.one_hot(act, nbr_action)
+  next_dist = model_cible(next_obs)  # (batch_size, n_actions, n_atoms)
+  next_q = tf.reduce_sum(z * next_dist, axis=2)  # Espérance
+  best_next_actions = tf.argmax(next_q, axis=1)
+
+  target_dist = tf.zeros((batch_size, nbr_action, n_atoms), dtype=tf.float32)
+  for i in range(batch_size):
+      proj_dist = tf.zeros((n_atoms,), dtype=tf.float32)
+      for j in range(n_atoms):
+          tzj = tf.clip_by_value(rew[i] + (1 - done[i]) * gamma * z[j], v_min, v_max)
+          bj = (tzj - v_min) / delta_z
+          l = tf.cast(tf.math.floor(bj), tf.int32)
+          u = tf.cast(tf.math.ceil(bj), tf.int32)
+          if l == u:
+              proj_dist = proj_dist + next_dist[i, best_next_actions[i], j] * tf.one_hot(l, n_atoms)
+          else:
+              proj_dist = proj_dist + next_dist[i, best_next_actions[i], j] * (
+                  (tf.cast(u, tf.float32) - bj) * tf.one_hot(l, n_atoms) + (bj - tf.cast(l, tf.float32)) * tf.one_hot(u, n_atoms)
+              )
+      target_dist = tf.tensor_scatter_nd_update(target_dist, [[i, act[i]]], [proj_dist])
+
   with tf.GradientTape() as tape:
-    all_Q_values=model_primaire(obs)
-    Q_values=tf.reduce_sum(all_Q_values*mask, axis=1, keepdims=True)
-    loss=my_loss(target_Q_values, Q_values)
-    loss = loss * weights
-    loss = tf.reduce_mean(loss)
+      all_dists = model_primaire(obs)
+      log_pred = tf.math.log(tf.clip_by_value(all_dists, 1e-6, 1.0))
+      loss = tf.keras.losses.categorical_crossentropy(target_dist, log_pred)
+      loss = tf.reduce_sum(loss * tf.expand_dims(weights, axis=1), axis=1)
+      loss = tf.reduce_mean(loss)
   gradients=tape.gradient(loss, model_primaire.trainable_variables)
   gradients = [tf.clip_by_norm(g, 10.0) for g in gradients]
   optimizer.apply_gradients(zip(gradients, model_primaire.trainable_variables))
   train_loss(loss)
-  td_errors = tf.abs(target_Q_values - Q_values)
-  td_errors_np = tf.stop_gradient(td_errors).numpy().flatten()
+  loss_history.append(loss.numpy())
+  td_errors = tf.abs(tf.reduce_sum(target_dist * z, axis=2) - tf.reduce_sum(all_dists * z, axis=2))
+  td_errors_np = tf.stop_gradient(tf.reduce_max(td_errors, axis=1)).numpy().flatten()
   replay_buffer.update_priorities(indices, td_errors_np)
   
 def train(debug=False):
@@ -270,30 +308,56 @@ def train(debug=False):
       a.assign(tau * b + (1 - tau) * a)
     
     np.save(file_stats, tab_s)
+    tab_s_list = list(tab_s)
     recent_mean_score = np.mean(tab_s)
     if recent_mean_score > best_score:
       print("Sauvegarde du modele")
       model_cible.save(file_model + ".keras")
       best_score = recent_mean_score
 
+  from scipy.ndimage import uniform_filter1d
+
+  tab_s_list = list(tab_s)
+  moving_avg = uniform_filter1d(tab_s_list, size=20)
+  max_scores = [max(tab_s_list[max(0, i - games_per_epoch):i + 1]) for i in range(len(tab_s_list))]
+  cumulative_rewards = np.cumsum(tab_s_list) / (np.arange(len(tab_s_list)) + 1)
+  epsilons = [max(1.0 - (i * epsilon_decay_rate), epsilon_min) for i in range(len(tab_s_list))]
+
   import matplotlib.pyplot as plt
 
-  plt.figure(figsize=(12, 5))
-  plt.subplot(1, 2, 1)
-  plt.plot(tab_s)
+  plt.figure(figsize=(15, 10))
+
+  plt.subplot(2, 2, 1)
+  plt.plot(tab_s_list, label="Score brut")
+  plt.plot(moving_avg, label="Moyenne glissante (20 jeux)")
+  plt.plot(max_scores, label="Score max/epoch")
+  plt.legend()
   plt.title("Scores au fil des jeux")
   plt.xlabel("Jeu")
   plt.ylabel("Score")
 
-  plt.subplot(1, 2, 2)
-  epsilons = [max(1.0 - (i * epsilon_decay_rate), epsilon_min) for i in range(len(tab_s))]
+  plt.subplot(2, 2, 2)
   plt.plot(epsilons)
   plt.title("Évolution de l'epsilon")
   plt.xlabel("Jeu")
   plt.ylabel("Epsilon")
 
+  plt.subplot(2, 2, 3)
+  plt.plot(cumulative_rewards)
+  plt.title("Reward cumulé moyen")
+  plt.xlabel("Jeu")
+  plt.ylabel("Reward moyen")
+
+  plt.subplot(2, 2, 4)
+  plt.plot(loss_history)
+  plt.title("Courbe de perte (loss)")
+  plt.xlabel("Itération d'entraînement")
+  plt.ylabel("Loss")
+
   plt.tight_layout()
   plt.show()
+
+loss_history = []
 
 model_primaire=model(16)
 model_primaire.summary()
