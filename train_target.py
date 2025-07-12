@@ -12,6 +12,18 @@ from keras import models, layers
 from keras import backend as K
 from keras.saving import register_keras_serializable
 import numpy as np
+from gymnasium.wrappers import AtariPreprocessing, FrameStack
+
+# For manual frame stacking in simulation
+class LazyFrames:
+    def __init__(self, frames):
+        self._frames = frames
+
+    def __array__(self, dtype=None):
+        out = np.concatenate(self._frames, axis=-1)
+        if dtype is not None:
+            out = out.astype(dtype)
+        return out
 import time
 import matplotlib.pyplot as plot
 import ale_py
@@ -19,8 +31,12 @@ import ale_py
 
 gym.register_envs(ale_py)
 
-env = gym.make("ALE/MsPacman-v5", render_mode="rgb_array")
-print("Liste des actions", env.unwrapped.get_action_meanings())
+env = gym.make("ALE/MsPacman-v5")
+# standard Atari preprocessing: grayscale, resize, frame-skip, reward clipping
+env = AtariPreprocessing(env, frame_skip=4, grayscale_obs=True, scale_obs=True)
+# stack 4 frames
+env = FrameStack(env, num_stack=4)
+print("Liste des actions", env.env.unwrapped.get_action_meanings())
 nbr_action = env.action_space.n
 
 file_model='my_model_target'
@@ -37,16 +53,6 @@ v_min = -10
 v_max = 10
 delta_z = (v_max - v_min) / (n_atoms - 1)
 z = tf.cast(tf.linspace(v_min, v_max, n_atoms), tf.float32)
-
-class LazyFrames:
-  def __init__(self, frames):
-    self._frames = frames
-
-  def __array__(self, dtype=None):
-    out = np.concatenate(self._frames, axis=-1)
-    if dtype is not None:
-      out = out.astype(dtype)
-    return out
 
 @register_keras_serializable()
 class NoisyDense(layers.Layer):
@@ -98,6 +104,10 @@ epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
 
 tab_s = deque(maxlen=200)
 
+# anneal beta from 0.4 to 1.0 over training
+beta_start = 0.4
+beta_frames = n_epochs * games_per_epoch
+
 class PrioritizedReplayBuffer:
   def __init__(self, capacity=100_000, alpha=0.6):
     self.capacity = capacity
@@ -123,20 +133,29 @@ class PrioritizedReplayBuffer:
       self.priorities[i] = abs(err) + 1e-6
 
 replay_buffer = PrioritizedReplayBuffer(capacity=50_000)
-batch_size = 16
+batch_size = 32
 
-def model(nbr_cc=32):
-  entree = layers.Input(shape=(84, 84, taille_sequence), dtype='float32')
-  x = layers.Conv2D(32, 8, strides=4, activation='relu')(entree)
-  x = layers.Conv2D(64, 4, strides=2, activation='relu')(x)
-  x = layers.Conv2D(64, 3, strides=1, activation='relu')(x)
-  x = layers.Flatten()(x)
-  
-  # C51 output: n_actions x n_atoms
-  output = NoisyDense(nbr_action * n_atoms)(x)
-  output = layers.Reshape((nbr_action, n_atoms))(output)
-  output = layers.Softmax(axis=-1)(output)  # Probabilités par action
-  return models.Model(inputs=entree, outputs=output)
+def model():
+    entree = layers.Input(shape=(84, 84, 4), dtype='float32')
+    x = layers.Conv2D(32, 8, strides=4, activation='relu')(entree)
+    x = layers.Conv2D(64, 4, strides=2, activation='relu')(x)
+    x = layers.Conv2D(64, 3, strides=1, activation='relu')(x)
+    x = layers.Flatten()(x)
+
+    # Value stream
+    v = layers.Dense(512, activation='relu')(x)
+    v = NoisyDense(n_atoms)(v)
+    v = layers.Reshape((1, n_atoms))(v)
+
+    # Advantage stream
+    a = layers.Dense(512, activation='relu')(x)
+    a = NoisyDense(nbr_action * n_atoms)(a)
+    a = layers.Reshape((nbr_action, n_atoms))(a)
+
+    # Combine streams into Q-distribution
+    q_atoms = v + (a - tf.reduce_mean(a, axis=1, keepdims=True))
+    out = layers.Softmax(axis=-1)(q_atoms)
+    return models.Model(inputs=entree, outputs=out)
 
 def transform_img(image):
   gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -236,8 +255,11 @@ def simulation(epsilon, debug=False):
 def my_loss(y, q):
   return tf.reduce_mean(tf.keras.losses.huber(y, q))
 
-def train_step():
-  samples, indices, weights = replay_buffer.sample(batch_size)
+@tf.function
+def train_step(frame_idx):
+  # compute current beta for prioritized replay
+  beta = min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
+  samples, indices, weights = replay_buffer.sample(batch_size, beta)
   obs, rew, act, next_obs, done = zip(*samples)
   # Ensure arrays and correct shapes
   obs = tf.convert_to_tensor(np.array(obs), dtype=tf.float32)
@@ -293,7 +315,7 @@ def train(debug=False):
       if debug:
         start_time=time.time()
       if len(replay_buffer.buffer) > 5000:
-        train_step()
+        train_step(total_steps)
       if debug:
         print("  Entrainement {:5.3f} seconde(s)".format(float(time.time()-start_time)))
         print("     loss: {:6.4f}".format(train_loss.result()))
@@ -359,7 +381,7 @@ def train(debug=False):
 
 loss_history = []
 
-model_primaire=model(16)
+model_primaire=model()
 model_primaire.summary()
 model_cible=tf.keras.models.clone_model(model_primaire)
 for a, b in zip(model_cible.variables, model_primaire.variables):
