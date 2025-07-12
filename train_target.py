@@ -27,7 +27,7 @@ file_model='my_model_target'
 file_stats='tab_score_target'
 
 gamma=tf.constant(0.99)
-tau = 0.005
+tau = 0.01
 n_step = 5
 gamma_n = gamma ** n_step
 n_step_buffer = deque(maxlen=n_step)
@@ -84,7 +84,7 @@ class NoisyDense(layers.Layer):
       })
       return config
 
-n_epochs=250
+n_epochs=150
 decalage_debut=90
 taille_sequence=6
 games_per_epoch=300
@@ -93,7 +93,7 @@ best_score=-np.inf
 
 epsilon = 1.0  # Starting value
 epsilon_min = 0.03  # Minimum value
-epsilon_decay_steps = 35_000  # Number of steps for linear decay
+epsilon_decay_steps = 20_000  # Number of steps for linear decay
 epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
 
 tab_s = deque(maxlen=200)
@@ -109,7 +109,7 @@ class PrioritizedReplayBuffer:
     self.buffer.append(experience)
     self.priorities.append(abs(td_error) + 1e-6)
 
-  def sample(self, batch_size=32, beta=0.4):
+  def sample(self, batch_size=16, beta=0.4):
     scaled_priorities = np.array(self.priorities) ** self.alpha
     probs = scaled_priorities / scaled_priorities.sum()
     indices = np.random.choice(len(self.buffer), batch_size, p=probs)
@@ -122,8 +122,8 @@ class PrioritizedReplayBuffer:
     for i, err in zip(indices, td_errors):
       self.priorities[i] = abs(err) + 1e-6
 
-replay_buffer = PrioritizedReplayBuffer()
-batch_size = 32
+replay_buffer = PrioritizedReplayBuffer(capacity=50_000)
+batch_size = 16
 
 def model(nbr_cc=32):
   entree = layers.Input(shape=(84, 84, taille_sequence), dtype='float32')
@@ -205,7 +205,7 @@ def simulation(epsilon, debug=False):
       tab_next_observations=np.array(tab_next_observations, dtype=np.float32)
       tab_rewards=np.array(tab_rewards, dtype=np.float32)
       tab_rewards = np.clip(tab_rewards, -1, 1)
-      tab_rewards += 0.1  # Bonus de survie
+      tab_rewards += 0.3
       tab_rewards = tab_rewards.reshape(-1)
       tab_actions=np.array(tab_actions, dtype=np.int32)
       if debug:
@@ -292,7 +292,7 @@ def train(debug=False):
       simulation(epsilon, debug=True)
       if debug:
         start_time=time.time()
-      if len(replay_buffer.buffer) > 10000:
+      if len(replay_buffer.buffer) > 5000:
         train_step()
       if debug:
         print("  Entrainement {:5.3f} seconde(s)".format(float(time.time()-start_time)))
@@ -365,6 +365,6 @@ model_cible=tf.keras.models.clone_model(model_primaire)
 for a, b in zip(model_cible.variables, model_primaire.variables):
   a.assign(b)
 
-optimizer=tf.keras.optimizers.Adam(learning_rate=1E-4)
+optimizer = tf.keras.optimizers.Adam(learning_rate=2E-4)
 train_loss=tf.keras.metrics.Mean()
 train(debug=True)
