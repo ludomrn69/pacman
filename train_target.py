@@ -11,7 +11,6 @@ from keras import models, layers
 from keras import backend as K
 from keras.saving import register_keras_serializable
 import numpy as np
-from gymnasium.wrappers import AtariPreprocessing, FrameStack
 import time
 import matplotlib.pyplot as plt
 import ale_py
@@ -32,11 +31,7 @@ class LazyFrames:
 
 gym.register_envs(ale_py)
 
-env = gym.make("ALE/MsPacman-v5")
-# standard Atari preprocessing: grayscale, resize, frame-skip, reward clipping
-env = AtariPreprocessing(env, frame_skip=4, grayscale_obs=True, scale_obs=True)
-# stack 4 frames
-env = FrameStack(env, num_stack=4)
+env = gym.make("ALE/MsPacman-v5", frameskip=4)
 print("Liste des actions", env.env.unwrapped.get_action_meanings())
 nbr_action = env.action_space.n
 
@@ -73,7 +68,7 @@ epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
 # Prioritized Replay parameters
 beta_start = 0.4
 beta_frames = n_epochs * games_per_epoch
-alpha = 0.6
+alpha = 0.75  # Donne plus d’importance aux transitions à fort TD-error
 
 tab_s = deque(maxlen=1000)  # Garde plus d'historique
 
@@ -188,8 +183,12 @@ def create_model():
     a = NoisyDense(nbr_action * n_atoms)(a)
     a = layers.Reshape((nbr_action, n_atoms))(a)
     
-    # Combine streams into Q-distribution
-    q_atoms = v + (a - tf.reduce_mean(a, axis=1, keepdims=True))
+    # Combine value and advantage streams using Keras layers
+    # Compute mean over the action dimension
+    a_mean = layers.GlobalAveragePooling1D()(a)
+    a_mean = layers.Reshape((1, n_atoms))(a_mean)
+    a_diff = layers.Subtract()([a, a_mean])
+    q_atoms = layers.Add()([v, a_diff])
     out = layers.Softmax(axis=-1)(q_atoms)
     
     return models.Model(inputs=entree, outputs=out)
@@ -271,7 +270,11 @@ def simulation(epsilon, debug=False):
         # Action selection with noisy networks (no epsilon needed)
         dist = model_primaire(np.expand_dims(np.array(tab_sequence), axis=0))
         q_values = tf.reduce_sum(z * dist, axis=2)
-        action = int(tf.argmax(q_values[0], axis=-1))
+        # Exploration forcée 5% du temps malgré NoisyNet
+        if np.random.rand() < 0.05:
+            action = env.action_space.sample()
+        else:
+            action = int(tf.argmax(q_values[0], axis=-1))
         
         # Store current state
         current_state = np.array(tab_sequence)
@@ -292,7 +295,7 @@ def simulation(epsilon, debug=False):
             
             if info['ale.lives'] < simulation.previous_lives:
                 life_lost = True
-                reward = -1.0  # Pénalité raisonnable au lieu de -50
+                reward -= 0.3  # Pénalité plus douce pour éviter stratégie trop défensive
                 simulation.previous_lives = info['ale.lives']
         
         score += original_reward
@@ -341,7 +344,6 @@ def simulation(epsilon, debug=False):
             
             return
 
-@tf.function
 def train_step(samples, weights, beta):
     obs, actions, rewards, next_obs, dones = zip(*samples)
     
@@ -375,8 +377,8 @@ def train_step(samples, weights, beta):
                 v_min, v_max
             )
             bj = (tzj - v_min) / delta_z
-            l = tf.cast(tf.floor(bj), tf.int32)
-            u = tf.cast(tf.ceil(bj), tf.int32)
+            l = tf.cast(tf.math.floor(bj), tf.int32)
+            u = tf.cast(tf.math.ceil(bj), tf.int32)
             
             # Distribute probability mass
             prob = next_dist_target[i, next_actions[i], j]
@@ -440,6 +442,7 @@ def train(debug=False):
         for game in trange(games_per_epoch, desc=f"Epoch {epoch+1:03d}", leave=False):
             if debug:
                 print(f"Epoch {epoch+1:03d}/{n_epochs:03d} | Jeu {game+1:03d}/{games_per_epoch:03d}")
+                print(f"  epsilon={epsilon:.3f}")
             
             # Run simulation
             simulation(epsilon, debug=debug)
@@ -489,12 +492,13 @@ def train(debug=False):
             max_score = np.max(recent_scores)
             
             print(f"Epoch {epoch+1:03d} - Score moyen: {mean_score:.1f}, Max: {max_score:.0f}")
+            print(f"  epsilon={epsilon:.3f} | Variance scores: {np.var(recent_scores):.1f}")
             
-            # Save best model
-            if mean_score > best_score:
-                print("Sauvegarde du meilleur modèle")
+            # Save best model based on max_score
+            if max_score > best_score:
+                print("Sauvegarde du modèle avec le meilleur score maximum")
                 model_primaire.save(f"{file_model}.keras")
-                best_score = mean_score
+                best_score = max_score
             
             # Save stats
             np.save(file_stats, list(tab_s))
