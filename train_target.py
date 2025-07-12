@@ -57,17 +57,17 @@ delta_z = (v_max - v_min) / (n_atoms - 1)
 z = tf.cast(tf.linspace(v_min, v_max, n_atoms), tf.float32)
 
 # Training parameters - Version corrigée
-n_epochs = 300
+n_epochs = 200
 games_per_epoch = 100  # Réduit pour feedback plus rapide
 batch_size = 32
 update_frequency = 4   # Update tous les 4 jeux
-target_update_frequency = 1000  # Update target moins fréquent
+target_update_frequency = 800  # Update target ajusté pour 200 époques
 best_score = -np.inf
 
 # Epsilon parameters - Version corrigée
 epsilon = 1.0
 epsilon_min = 0.01
-epsilon_decay_steps = 50_000  # Decay plus lent
+epsilon_decay_steps = 40_000  # Ajusté pour 200 époques (200*100*2)
 epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
 
 # Prioritized Replay parameters
