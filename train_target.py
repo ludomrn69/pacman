@@ -61,8 +61,8 @@ best_score = -np.inf
 
 # Epsilon parameters - Version corrigée
 epsilon = 1.0
-epsilon_min = 0.01
-epsilon_decay_steps = 40_000  # Ajusté pour 200 époques (200*100*2)
+epsilon_min = 0.03
+epsilon_decay_steps = 15_000  # Ajusté pour 200 époques (200*100*2)
 epsilon_decay_rate = (epsilon - epsilon_min) / epsilon_decay_steps
 
 # Prioritized Replay parameters

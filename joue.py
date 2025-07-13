@@ -51,10 +51,10 @@ def preprocess_frame(frame):
 def stack_frames(frames, state, is_new_episode):
     frame = preprocess_frame(state)
     if is_new_episode:
-        frames = [frame] * 6
+        frames = [frame] * 4
     else:
         frames.append(frame)
-        frames = frames[-6:]
+        frames = frames[-4:]
     stacked_state = np.stack(frames, axis=-1)
     return frames, stacked_state
 
