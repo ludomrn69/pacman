@@ -67,6 +67,23 @@ def set_global_seeds(seed: int):
     th.cuda.manual_seed_all(seed)
 
 
+def linear_schedule(start: float, end: float):
+    """SB3-style linear schedule from `start` to `end`.
+    progress_remaining goes from 1 (start) to 0 (end)."""
+    def func(progress_remaining: float) -> float:
+        return end + (start - end) * progress_remaining
+    return func
+
+
+def _choose_batch_size(buffer_size: int) -> int:
+    """Pick a batch size that divides the rollout buffer size (n_steps * n_envs)."""
+    for bs in (1024, 512, 256):
+        if buffer_size % bs == 0:
+            return bs
+    return 256
+
+
+
 def build_venv(env_id: str,
                n_envs: int,
                seed: int,
@@ -98,13 +115,22 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=[100, 101, 102, 103, 104])
     parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--eval-freq", type=int, default=100_000,
+    parser.add_argument("--eval-freq", type=int, default=800_000,
                         help="Evaluate every N steps (per environment). Final frequency is eval_freq // n_envs.")
     parser.add_argument("--checkpoint-freq", type=int, default=500_000)
     parser.add_argument("--full-action-space", action="store_true",
                         help="Use the full 18-action space instead of reduced action set.")
     parser.add_argument("--subproc", action="store_true", help="Use SubprocVecEnv (default).")
     parser.add_argument("--dummy", action="store_true", help="Use DummyVecEnv instead of SubprocVecEnv.")
+    parser.add_argument("--anneal-lr", action="store_true", help="Linearly anneal learning rate from lr-start to lr-end.")
+    parser.add_argument("--lr-start", type=float, default=2e-4)
+    parser.add_argument("--lr-end", type=float, default=5e-5)
+    parser.add_argument("--n-steps", type=int, default=512)
+    parser.add_argument("--n-epochs", type=int, default=3)
+    parser.add_argument("--ent-coef", type=float, default=0.02)
+    parser.add_argument("--max-grad-norm", type=float, default=0.3)
+    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--clip-range", type=float, default=0.1)
     args = parser.parse_args()
 
     # Sanity
@@ -125,23 +151,24 @@ def main():
     eval_env = build_venv(args.env_id, 1, args.seed + 10,
                           make_eval_wrapper(), args.full_action_space, vec_env_cls=DummyVecEnv)
 
-    # Auto-adjust batch size for single-env debug runs (keeps it a factor of n_steps * n_envs)
-    _batch_size = 256 if args.n_envs == 1 else 512
-    # PPO hyperparameters (solid defaults for Atari)
+    # Auto-pick a batch size that divides the buffer size
+    _buffer_size = args.n_steps * args.n_envs
+    _batch_size = _choose_batch_size(_buffer_size)
+    # PPO hyperparameters (optimized defaults for Atari stability)
     model = PPO(
         "CnnPolicy",
         train_env,
-        n_steps=256,
+        n_steps=args.n_steps,
         batch_size=_batch_size,
-        n_epochs=4,
-        learning_rate=3e-4,
+        n_epochs=args.n_epochs,
+        learning_rate=linear_schedule(args.lr_start, args.lr_end) if args.anneal_lr else args.lr_start,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.1,
-        ent_coef=0.01,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
         vf_coef=0.5,
-        max_grad_norm=0.5,
-        target_kl=0.02,
+        max_grad_norm=args.max_grad_norm,
+        target_kl=args.target_kl,
         tensorboard_log=tb_log,
         verbose=1,
         seed=args.seed,
@@ -162,7 +189,8 @@ def main():
         n_eval_episodes=args.eval_episodes,
         deterministic=True,
         render=False,
-        callback_after_eval=early_stop  # check plateau after each evaluation
+        callback_after_eval=early_stop,  # check plateau after each evaluation
+        verbose=1
     )
     checkpoint_callback = CheckpointCallback(save_freq=max(args.checkpoint_freq // args.n_envs, 1),
                                              save_path=args.save_dir, name_prefix="ckpt")
@@ -204,6 +232,7 @@ def main():
         mean_r = float(np.mean(all_returns))
         std_r = float(np.std(all_returns))
         print(f"Mean eval return over {len(all_returns)} episodes: {mean_r:.1f} ± {std_r:.1f}")
+
 
     # Clean up
     train_env.close()
