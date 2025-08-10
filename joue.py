@@ -92,8 +92,7 @@ for episode in range(num_episodes):
 
         frames, state = stack_frames(frames, obs, False)
         total_reward += reward
-        time.sleep(0.01)
-
+        
     print(f"Épisode {episode+1} terminé avec un score de {total_reward}")
 
 env.close()
