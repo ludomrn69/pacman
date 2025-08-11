@@ -23,7 +23,7 @@ import gymnasium as gym
 from gymnasium.wrappers import GrayscaleObservation, ResizeObservation
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
-    EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList, ProgressBarCallback
+    EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList, ProgressBarCallback, BaseCallback
 )
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage, SubprocVecEnv, DummyVecEnv
@@ -33,7 +33,19 @@ import ale_py
 
 gym.register_envs(ale_py)
 
-def make_train_wrapper(noop_max: int = 30, terminal_on_life_loss: bool = True) -> Callable[[gym.Env], gym.Env]:
+class RandomActionWrapper(gym.Wrapper):
+    """With probability eps, replace the agent action by a random action (training only).
+    Helps escape local traps/corners and improves exploration."""
+    def __init__(self, env: gym.Env, eps: float = 0.0):
+        super().__init__(env)
+        self.eps = eps
+
+    def step(self, action):
+        if self.eps > 0.0 and np.random.rand() < self.eps:
+            action = self.action_space.sample()
+        return self.env.step(action)
+
+def make_train_wrapper(noop_max: int = 30, terminal_on_life_loss: bool = True, random_action_eps: float = 0.0) -> Callable[[gym.Env], gym.Env]:
     """
     Training-time wrapper: No-op reset, episodic life, grayscale+resize. No reward clipping (we care about raw score).
     We avoid any extra frame-skip here because ALE v5 already uses frameskip=4 and sticky actions by default.
@@ -44,6 +56,7 @@ def make_train_wrapper(noop_max: int = 30, terminal_on_life_loss: bool = True) -
             env = EpisodicLifeEnv(env)
         env = ResizeObservation(env, (84, 84))          # (84, 84, 3)
         env = GrayscaleObservation(env, keep_dim=True)  # (84, 84, 1)
+        env = RandomActionWrapper(env, eps=random_action_eps)
         return env
     return _wrap
 
@@ -81,6 +94,66 @@ def _choose_batch_size(buffer_size: int) -> int:
         if buffer_size % bs == 0:
             return bs
     return 256
+
+
+class RandomActionAnnealCallback(BaseCallback):
+    """Linearly anneal RandomActionWrapper.eps from start to end over a fraction of training."""
+    def __init__(self, venv, start_eps: float, end_eps: float, frac: float, total_timesteps: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.venv = venv
+        self.start_eps = float(start_eps)
+        self.end_eps = float(end_eps)
+        self.anneal_steps = max(1, int(total_timesteps * max(0.0, min(1.0, frac))))
+
+    def _set_eps_on_envs(self, eps: float):
+        try:
+            envs = self.venv.envs
+        except Exception:
+            envs = []
+        for e in envs:
+            cur = e
+            # Traverse wrapper chain to find RandomActionWrapper
+            while hasattr(cur, 'env'):
+                if isinstance(cur, RandomActionWrapper):
+                    cur.eps = eps
+                    break
+                cur = cur.env
+
+    def _on_training_start(self) -> None:
+        self._set_eps_on_envs(self.start_eps)
+
+    def _on_step(self) -> bool:
+        t = self.model.num_timesteps
+        if t <= self.anneal_steps:
+            alpha = 1.0 - (t / self.anneal_steps)
+            eps = self.end_eps + (self.start_eps - self.end_eps) * alpha
+        else:
+            eps = self.end_eps
+        self._set_eps_on_envs(eps)
+        return True
+
+
+class EntropyCoefAnnealCallback(BaseCallback):
+    """Linearly anneal model.ent_coef from start to end over total_timesteps."""
+    def __init__(self, start: float, end: float, total_timesteps: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.start = float(start)
+        self.end = float(end)
+        self.total = int(max(1, total_timesteps))
+
+    def _on_training_start(self) -> None:
+        # initialize to start value
+        self.model.ent_coef = float(self.start)
+
+    def _on_step(self) -> bool:
+        t = self.model.num_timesteps
+        if t <= self.total:
+            progress_remaining = 1.0 - (t / self.total)
+            coef = self.end + (self.start - self.end) * progress_remaining
+        else:
+            coef = self.end
+        self.model.ent_coef = float(coef)
+        return True
 
 
 
@@ -131,6 +204,12 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, default=0.3)
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--clip-range", type=float, default=0.1)
+    parser.add_argument("--random-action-eps", type=float, default=0.01, help="Probability to take a random action during training (exploration boost).")
+    parser.add_argument("--random-action-eps-end", type=float, default=0.0, help="Final random action probability after annealing.")
+    parser.add_argument("--random-action-anneal-frac", type=float, default=0.5, help="Fraction of total timesteps over which to anneal random-action epsilon.")
+    parser.add_argument("--anneal-ent", action="store_true", help="Linearly anneal entropy coefficient from ent-start to ent-end.")
+    parser.add_argument("--ent-start", type=float, default=0.03)
+    parser.add_argument("--ent-end", type=float, default=0.005)
     args = parser.parse_args()
 
     # Sanity
@@ -145,7 +224,7 @@ def main():
 
     # Training and evaluation environments
     train_env = build_venv(args.env_id, args.n_envs, args.seed,
-                           make_train_wrapper(), args.full_action_space, vec_env_cls=vec_cls)
+                           make_train_wrapper(random_action_eps=args.random_action_eps), args.full_action_space, vec_env_cls=vec_cls)
 
     # Note: eval env without EpisodicLife, deterministic policy
     eval_env = build_venv(args.env_id, 1, args.seed + 10,
@@ -165,7 +244,8 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
+        # Start with ent_start if we plan to anneal via callback; otherwise use fixed ent_coef
+        ent_coef=(args.ent_start if args.anneal_ent else args.ent_coef),
         vf_coef=0.5,
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
@@ -194,7 +274,12 @@ def main():
     )
     checkpoint_callback = CheckpointCallback(save_freq=max(args.checkpoint_freq // args.n_envs, 1),
                                              save_path=args.save_dir, name_prefix="ckpt")
-    callbacks = CallbackList([eval_callback, checkpoint_callback, ProgressBarCallback()])
+    callbacks_list = [eval_callback, checkpoint_callback, ProgressBarCallback()]
+    if args.random_action_eps > args.random_action_eps_end:
+        callbacks_list.append(RandomActionAnnealCallback(train_env, args.random_action_eps, args.random_action_eps_end, args.random_action_anneal_frac, args.total_timesteps))
+    if args.anneal_ent:
+        callbacks_list.append(EntropyCoefAnnealCallback(args.ent_start, args.ent_end, args.total_timesteps))
+    callbacks = CallbackList(callbacks_list)
 
     # Train
     model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
@@ -215,15 +300,18 @@ def main():
 
     all_returns = []
     for s in args.eval_seeds:
-        obs, info = eval_env.reset(seed=s)
-        ep_returns = []
+        # Seed the vectorized eval env
+        try:
+            eval_env.seed(s)
+        except Exception:
+            pass
+        obs = eval_env.reset()
         ep_return = 0.0
         while True:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = eval_env.step(action)
-            ep_return += float(reward)
-            if terminated or truncated:
-                ep_returns.append(ep_return)
+            obs, rewards, dones, infos = eval_env.step(action)
+            ep_return += float(rewards[0])
+            if dones[0]:
                 all_returns.append(ep_return)
                 print(f"[seed {s}] Episode return: {ep_return:.1f}")
                 break
