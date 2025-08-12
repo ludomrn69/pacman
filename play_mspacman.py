@@ -46,8 +46,21 @@ def main():
 
     print(f"Loading model: {args.model_path}")
     model = PPO.load(args.model_path, device="auto")
+    # Match env action space with the model expectation (auto-detect)
+    expected_n = getattr(getattr(model, "action_space", None), "n", None)
 
     env = make_play_vecenv(args.env_id, args.seed, args.full_action_space)
+    # If the model was trained with a different action space (full vs minimal), rebuild env accordingly
+    try:
+      actual_n = env.action_space.n
+    except Exception:
+      actual_n = None
+    if expected_n is not None and actual_n is not None and expected_n != actual_n:
+      want_full = expected_n > actual_n
+      if want_full != args.full_action_space:
+        print(f"[info] Model expects {expected_n} actions but env has {actual_n}. Rebuilding with full_action_space={want_full}.")
+        env.close()
+        env = make_play_vecenv(args.env_id, args.seed, want_full)
 
     sleep_dt = 1.0 / max(1, args.fps)
     for ep in range(args.episodes):

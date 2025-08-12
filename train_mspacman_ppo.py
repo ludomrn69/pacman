@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import os
+import time
 import random
 from pathlib import Path
 from typing import Callable
@@ -23,10 +24,12 @@ import gymnasium as gym
 from gymnasium.wrappers import GrayscaleObservation, ResizeObservation
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
-    EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList, ProgressBarCallback, BaseCallback
+    EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, StopTrainingOnRewardThreshold,
+    CallbackList, ProgressBarCallback, BaseCallback
 )
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage, SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.torch_layers import NatureCNN
 from stable_baselines3.common.atari_wrappers import EpisodicLifeEnv, NoopResetEnv
 import ale_py
 
@@ -156,6 +159,28 @@ class EntropyCoefAnnealCallback(BaseCallback):
         return True
 
 
+# ---- NEW: TimeLimitCallback ----
+class TimeLimitCallback(BaseCallback):
+    """Stop training after a given wall-clock time (in seconds)."""
+    def __init__(self, time_limit_seconds: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.time_limit_seconds = int(time_limit_seconds)
+        self._start = None
+
+    def _on_training_start(self) -> None:
+        self._start = time.time()
+
+    def _on_step(self) -> bool:
+        if self._start is None:
+            return True
+        elapsed = time.time() - self._start
+        if elapsed >= self.time_limit_seconds:
+            if self.verbose > 0:
+                print(f"Time limit reached ({self.time_limit_seconds}s). Stopping training.")
+            return False
+        return True
+
+
 
 def build_venv(env_id: str,
                n_envs: int,
@@ -188,28 +213,33 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=[100, 101, 102, 103, 104])
     parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--eval-freq", type=int, default=800_000,
+    parser.add_argument("--eval-freq", type=int, default=1_600_000,
                         help="Evaluate every N steps (per environment). Final frequency is eval_freq // n_envs.")
+    parser.add_argument("--no-episodic-life", action="store_true", help="Disable EpisodicLife during training (use true game over).")
     parser.add_argument("--checkpoint-freq", type=int, default=500_000)
     parser.add_argument("--full-action-space", action="store_true",
                         help="Use the full 18-action space instead of reduced action set.")
     parser.add_argument("--subproc", action="store_true", help="Use SubprocVecEnv (default).")
     parser.add_argument("--dummy", action="store_true", help="Use DummyVecEnv instead of SubprocVecEnv.")
     parser.add_argument("--anneal-lr", action="store_true", help="Linearly anneal learning rate from lr-start to lr-end.")
-    parser.add_argument("--lr-start", type=float, default=2e-4)
+    parser.add_argument("--lr-start", type=float, default=3e-4)
     parser.add_argument("--lr-end", type=float, default=5e-5)
-    parser.add_argument("--n-steps", type=int, default=512)
-    parser.add_argument("--n-epochs", type=int, default=3)
+    parser.add_argument("--n-steps", type=int, default=256)
+    parser.add_argument("--n-epochs", type=int, default=4)
     parser.add_argument("--ent-coef", type=float, default=0.02)
     parser.add_argument("--max-grad-norm", type=float, default=0.3)
-    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--target-kl", type=float, default=0.04)
     parser.add_argument("--clip-range", type=float, default=0.1)
-    parser.add_argument("--random-action-eps", type=float, default=0.01, help="Probability to take a random action during training (exploration boost).")
+    parser.add_argument("--clip-range-vf", type=float, default=0.2, help="Clipping range for the value function.")
+    parser.add_argument("--pi-sizes", type=str, default="1024,512", help="Comma-separated hidden sizes for the policy MLP head.")
+    parser.add_argument("--vf-sizes", type=str, default="1024,512", help="Comma-separated hidden sizes for the value MLP head.")
+    parser.add_argument("--random-action-eps", type=float, default=0.03, help="Probability to take a random action during training (exploration boost).")
     parser.add_argument("--random-action-eps-end", type=float, default=0.0, help="Final random action probability after annealing.")
-    parser.add_argument("--random-action-anneal-frac", type=float, default=0.5, help="Fraction of total timesteps over which to anneal random-action epsilon.")
+    parser.add_argument("--random-action-anneal-frac", type=float, default=0.8, help="Fraction of total timesteps over which to anneal random-action epsilon.")
     parser.add_argument("--anneal-ent", action="store_true", help="Linearly anneal entropy coefficient from ent-start to ent-end.")
-    parser.add_argument("--ent-start", type=float, default=0.03)
+    parser.add_argument("--ent-start", type=float, default=0.06)
     parser.add_argument("--ent-end", type=float, default=0.005)
+    parser.add_argument("--target-eval", type=float, default=1500.0, help="Stop early if eval/mean_reward >= this threshold (0=disabled).")
     args = parser.parse_args()
 
     # Sanity
@@ -223,8 +253,17 @@ def main():
     vec_cls = DummyVecEnv if args.dummy else SubprocVecEnv
 
     # Training and evaluation environments
-    train_env = build_venv(args.env_id, args.n_envs, args.seed,
-                           make_train_wrapper(random_action_eps=args.random_action_eps), args.full_action_space, vec_env_cls=vec_cls)
+    train_env = build_venv(
+        args.env_id,
+        args.n_envs,
+        args.seed,
+        make_train_wrapper(
+            terminal_on_life_loss=(not args.no_episodic_life),
+            random_action_eps=args.random_action_eps,
+        ),
+        args.full_action_space,
+        vec_env_cls=vec_cls,
+    )
 
     # Note: eval env without EpisodicLife, deterministic policy
     eval_env = build_venv(args.env_id, 1, args.seed + 10,
@@ -233,6 +272,10 @@ def main():
     # Auto-pick a batch size that divides the buffer size
     _buffer_size = args.n_steps * args.n_envs
     _batch_size = _choose_batch_size(_buffer_size)
+    # Build policy kwargs with larger MLP heads for Atari (helps break plateaus)
+    pi_sizes = tuple(int(x) for x in args.pi_sizes.split(",") if x)
+    vf_sizes = tuple(int(x) for x in args.vf_sizes.split(",") if x)
+    policy_kwargs = dict(net_arch=[dict(pi=list(pi_sizes), vf=list(vf_sizes))])
     # PPO hyperparameters (optimized defaults for Atari stability)
     model = PPO(
         "CnnPolicy",
@@ -244,11 +287,13 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=args.clip_range,
+        clip_range_vf=args.clip_range_vf,
         # Start with ent_start if we plan to anneal via callback; otherwise use fixed ent_coef
         ent_coef=(args.ent_start if args.anneal_ent else args.ent_coef),
         vf_coef=0.5,
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
+        policy_kwargs=policy_kwargs,
         tensorboard_log=tb_log,
         verbose=1,
         seed=args.seed,
@@ -261,6 +306,10 @@ def main():
         min_evals=5,                  # give it at least 5 evals before starting to count
         verbose=1
     )
+    threshold_cb = None
+    if args.target_eval and args.target_eval > 0:
+        threshold_cb = StopTrainingOnRewardThreshold(reward_threshold=args.target_eval, verbose=1)
+    after_eval_cb = early_stop if threshold_cb is None else CallbackList([early_stop, threshold_cb])
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=args.save_dir,
@@ -269,7 +318,7 @@ def main():
         n_eval_episodes=args.eval_episodes,
         deterministic=True,
         render=False,
-        callback_after_eval=early_stop,  # check plateau after each evaluation
+        callback_after_eval=after_eval_cb,  # plateau + optional reward threshold
         verbose=1
     )
     checkpoint_callback = CheckpointCallback(save_freq=max(args.checkpoint_freq // args.n_envs, 1),
