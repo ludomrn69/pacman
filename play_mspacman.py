@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Play a trained PPO agent on ALE/MsPacman-v5 with on-screen rendering.
+Play a trained QRDQN agent on ALE/MsPacman-v5 with on-screen rendering.
 Usage:
-  python play_mspacman.py --model-path runs/ppo_mspacman_opt/best_model.zip --episodes 3 --fps 60
+  python play_mspacman.py --model-path runs/qrdqn_mspacman/best_model.zip --episodes 3 --fps 60
 """
 
 import argparse
 import time
 import gymnasium as gym
-from stable_baselines3 import PPO
+from sb3_contrib import QRDQN
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
 from stable_baselines3.common.atari_wrappers import NoopResetEnv
 from gymnasium.wrappers import ResizeObservation, GrayscaleObservation
@@ -36,7 +36,7 @@ def make_play_vecenv(env_id: str, seed: int | None, full_action_space: bool):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", type=str, default="runs/ppo_mspacman_opt/best_model.zip")
+    p.add_argument("--model-path", type=str, default="runs/qrdqn_mspacman/best_model.zip")
     p.add_argument("--env-id", type=str, default="ALE/MsPacman-v5")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--fps", type=int, default=60)
@@ -45,7 +45,7 @@ def main():
     args = p.parse_args()
 
     print(f"Loading model: {args.model_path}")
-    model = PPO.load(args.model_path, device="auto")
+    model = QRDQN.load(args.model_path, device="auto")
     # Match env action space with the model expectation (auto-detect)
     expected_n = getattr(getattr(model, "action_space", None), "n", None)
 

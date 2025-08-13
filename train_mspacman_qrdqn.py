@@ -8,7 +8,6 @@ Choix clés (simple et efficaces) :
 - Wrappers Atari propres : NoopReset(30), Resize(84x84), Grayscale, FrameStack(4)
 - Entraînement avec EpisodicLife + ClipReward; Évaluation sans ces biais
 - Espace d’actions COMPLET (recommandé sur Atari)
-- Early stop si moyenne >= 1500
 - Meilleur modèle sauvegardé + TensorBoard
 - Pas de PER, pas de NoisyNet (inutile/fragile ici) et AUCUN paramètre de timeout
 """
@@ -24,7 +23,7 @@ from stable_baselines3.common.atari_wrappers import (
     NoopResetEnv, EpisodicLifeEnv, ClipRewardEnv
 )
 from stable_baselines3.common.callbacks import (
-    EvalCallback, CheckpointCallback, StopTrainingOnRewardThreshold, CallbackList, ProgressBarCallback
+    EvalCallback, CheckpointCallback, CallbackList
 )
 from sb3_contrib import QRDQN
 import ale_py
@@ -115,8 +114,6 @@ def main():
         device="auto",
     )
 
-    # Callbacks : évaluation périodique + arrêt quand >= 1500 + checkpoints
-    early_stop = StopTrainingOnRewardThreshold(reward_threshold=1500.0, verbose=1)
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=args.save_dir,
@@ -125,14 +122,14 @@ def main():
         n_eval_episodes=args.eval_episodes,
         deterministic=True,
         render=False,
-        callback_after_eval=early_stop,
         verbose=1,
     )
     ckpt_cb = CheckpointCallback(save_freq=args.checkpoint_freq, save_path=args.save_dir, name_prefix="ckpt")
 
     model.learn(
         total_timesteps=args.total_timesteps,
-        callback=CallbackList([eval_cb, ckpt_cb, ProgressBarCallback()]),
+        callback=CallbackList([eval_cb, ckpt_cb]),
+        progress_bar=True,
         log_interval=100,
     )
 
