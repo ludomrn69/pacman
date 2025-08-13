@@ -1,4 +1,7 @@
 /venv
+/.venv
+/.vs
+/.vscode
 ppo_pacman.zip
 ppo_pacman_super_improved.zip
 ppo_pacman_improved.zip
