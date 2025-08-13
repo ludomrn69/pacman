@@ -36,7 +36,7 @@ def make_play_vecenv(env_id: str, seed: int | None, full_action_space: bool):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", type=str, default="runs/qrdqn_mspacman/best_model.zip")
+    p.add_argument("--model-path", type=str, default="../runs/qrdqn_mspacman/best_model.zip")
     p.add_argument("--env-id", type=str, default="ALE/MsPacman-v5")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--fps", type=int, default=60)

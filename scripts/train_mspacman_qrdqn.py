@@ -76,7 +76,7 @@ def build_vec_env(wrapper):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--save-dir", type=str, default="runs/qrdqn_mspacman")
+    p.add_argument("--save-dir", type=str, default="../runs/qrdqn_mspacman")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--total-timesteps", type=int, default=10_000_000)
     p.add_argument("--eval-freq", type=int, default=100_000)
