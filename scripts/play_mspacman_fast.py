@@ -24,7 +24,7 @@ def make_play_vecenv(env_id: str, seed: int | None, full_action_space: bool):
         env = gym.make(env_id, render_mode="human", full_action_space=full_action_space)
         env = NoopResetEnv(env, noop_max=30)
         # Important: resize then grayscale to keep shape (84,84,1)
-        env = ResizeObservation(env, (84, 84))
+        env = ResizeObservation(env, (80, 80))
         env = GrayscaleObservation(env, keep_dim=True)
         if seed is not None:
             env.reset(seed=seed)
@@ -36,7 +36,7 @@ def make_play_vecenv(env_id: str, seed: int | None, full_action_space: bool):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", type=str, default="runs/qrdqn_mspacman/best_model.zip")
+    p.add_argument("--model-path", type=str, default="runs/qrdqn_mspacman/fast_model.zip")
     p.add_argument("--env-id", type=str, default="ALE/MsPacman-v5")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--fps", type=int, default=60)
